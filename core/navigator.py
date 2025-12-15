@@ -13,14 +13,14 @@ import time
 
 
 class SkyNavigator:
-    def __init__(self, dataset_path, waypoints_file):
+    def __init__(self, dataset_path, waypoints_file, use_edge_feature=True):
         self.dataset_path = dataset_path
         self.waypoints = self._load_json(waypoints_file)
         self.current_idx = 0
+        self.use_edge_feature = use_edge_feature # 新增：是否启用边缘特征
         
-        # 初始化 ORB 特征提取器
-        # nfeatures=500: 限制特征点数量，保证速度
-        self.orb = cv2.ORB_create(nfeatures=500)
+        # 调整 ORB 参数：因为边缘图特征点较少，需要降低阈值灵敏度
+        self.orb = cv2.ORB_create(nfeatures=1000, scoreType=cv2.ORB_FAST_SCORE)
         
         # 初始化匹配器 (使用汉明距离，适合二进制描述符)
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
@@ -44,6 +44,25 @@ class SkyNavigator:
             return []
         with open(path, 'r', encoding='utf-8') as f:
             return json.load(f)
+    
+    def _preprocess(self, img):
+        """
+        核心改进：图像预处理
+        将图像转换为边缘图，抵抗光照变化
+        """
+        # 1. 统一转灰度
+        if len(img.shape) == 3:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = img
+
+        if self.use_edge_feature:
+            # 2. Canny 边缘检测
+            # 阈值需要根据晨岛的画风微调，建议 50, 150
+            edges = cv2.Canny(gray, 50, 150)
+            return edges
+        else:
+            return gray
 
     def load_waypoint(self, index):
         """加载指定索引的路点作为当前目标"""
@@ -60,10 +79,12 @@ class SkyNavigator:
             return False
 
         # 读取并预处理目标图片
-        img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-        self.target_img = img
+        raw_img = cv2.imread(img_path)
+        # 注意：这里要对目标图做同样的预处理（转边缘）
+        processed_img = self._preprocess(raw_img)
+        self.target_img = processed_img
         # 提取目标的特征点和描述符
-        self.target_kp, self.target_des = self.orb.detectAndCompute(img, None)
+        self.target_kp, self.target_des = self.orb.detectAndCompute(processed_img, None)
         
         print(f"切换目标 -> ID: {wp['id']} Action: {wp['action']} {wp.get('description', '')}")
         return True
@@ -84,13 +105,13 @@ class SkyNavigator:
         if self.target_des is None:
             return 0, 0
 
-        # 1. 预处理屏幕画面
-        gray_screen = cv2.cvtColor(screen_frame, cv2.COLOR_BGR2GRAY)
+        # 1. 预处理屏幕画面 (转边缘)
+        processed_screen = self._preprocess(screen_frame)
         
         # 2. 提取屏幕特征
-        screen_kp, screen_des = self.orb.detectAndCompute(gray_screen, None)
+        screen_kp, screen_des = self.orb.detectAndCompute(processed_screen, None)
         
-        if screen_des is None or len(screen_des) < 10:
+        if screen_des is None or len(screen_des) < 5:
             # 画面太黑或无纹理（如纯色云层），无法匹配
             self.consecutive_misses += 1
             return 0, 0.0
@@ -101,11 +122,10 @@ class SkyNavigator:
         # 4. 筛选优质匹配点 (排序)
         matches = sorted(matches, key=lambda x: x.distance)
         
-        # 取前15%的匹配点，或者至少前10个
-        num_good = max(10, int(len(matches) * 0.15))
-        good_matches = matches[:num_good]
+        # 取前 15% 且距离小于 60 的点（边缘匹配容错率要低一点）
+        good_matches = [m for m in matches[:int(len(matches)*0.15)] if m.distance < 60]
         
-        if len(good_matches) < 5:
+        if len(good_matches) < 4:
             self.consecutive_misses += 1
             return 0, 0.0
 
@@ -117,22 +137,14 @@ class SkyNavigator:
         dst_pts = np.float32([screen_kp[m.trainIdx].pt for m in good_matches])
         
         # 计算重心 (Centroid) 的差异
-        # 如果 dst_center_x > src_center_x，说明屏幕里的物体在右边 -> 或者是视角偏左了？
-        # 在FPS/TPS游戏中：
-        # 如果目标物体在屏幕右侧 (dst_x 大)，我们需要向右转鼠标，把它移到中心？
-        # 不，我们希望屏幕画面(dst) 变成 目标画面(src)。
-        # 如果 dst_x (当前) > src_x (目标)，说明物体偏右，我们需要向右转视角来对准它。
-        
         center_src = np.mean(src_pts, axis=0)
         center_dst = np.mean(dst_pts, axis=0)
         
         offset_x = center_dst[0] - center_src[0]
         
-        # 6. 计算相似度评分 (基于特征点距离的倒数)
+        # 6. 重新计算分数逻辑，适应边缘特征
         avg_dist = np.mean([m.distance for m in good_matches])
-        # 距离越小越相似。通常 avg_dist 在 30-70 之间。
-        # 归一化一个分数
-        similarity = max(0, 1 - (avg_dist / 100.0))
+        similarity = max(0, 1 - (avg_dist / 80.0)) # 调整分母以适应边缘特征
         
         # 更新连续丢失目标的帧数
         if similarity < 0.2: # 假设 0.2 是极低分

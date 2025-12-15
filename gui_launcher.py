@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-光遇辅助程序UI控制器
+光遇辅助程序UI控制器 - 高级版
 实现紧急停止功能和状态显示
 """
 
@@ -10,195 +10,165 @@ from tkinter import ttk
 import threading
 import time
 import keyboard  # 需要 pip install keyboard 用于全局热键
-from core.navigator import SkyNavigator
-from core.input_controller import InputController
-from main import screen_capture
+import queue
+import os
+from PIL import Image, ImageTk
+from main import main_loop
 
 
-class AutoSkyGUI:
+class AdvancedGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("AutoSky Controller")
-        self.root.geometry("300x150")
+        self.root.title("AutoSky Pro Dashboard")
+        self.root.geometry("800x600")
         self.root.attributes('-topmost', True) # 窗口置顶
-
-        # 状态变量
-        self.is_running = False
+        
+        # 数据通信队列 (Logic Thread -> UI Thread)
+        self.data_queue = queue.Queue()
         self.stop_event = threading.Event()
-        self.thread = None
-
-        # UI 组件
-        self.status_label = ttk.Label(root, text="状态: 就绪", font=("Arial", 12))
-        self.status_label.pack(pady=10)
-
-        self.btn_frame = ttk.Frame(root)
-        self.btn_frame.pack(pady=10)
-
-        self.start_btn = ttk.Button(self.btn_frame, text="开始运行 (F9)", command=self.start_program)
-        self.start_btn.pack(side=tk.LEFT, padx=5)
-
-        self.stop_btn = ttk.Button(self.btn_frame, text="停止 (F10)", command=self.stop_program, state=tk.DISABLED)
-        self.stop_btn.pack(side=tk.LEFT, padx=5)
-
-        self.info_label = ttk.Label(root, text="长按 F10 强制停止", foreground="red")
-        self.info_label.pack(side=tk.BOTTOM, pady=5)
+        
+        # === 布局 ===
+        # 左侧：控制区
+        left_panel = ttk.Frame(root, padding="10")
+        left_panel.pack(side=tk.LEFT, fill=tk.Y)
+        
+        ttk.Label(left_panel, text="控制台", font=16).pack(pady=10)
+        self.btn_start = ttk.Button(left_panel, text="启动 (F9)", command=self.start)
+        self.btn_start.pack(fill=tk.X, pady=5)
+        self.btn_stop = ttk.Button(left_panel, text="停止 (F10)", command=self.stop, state=tk.DISABLED)
+        self.btn_stop.pack(fill=tk.X, pady=5)
+        
+        # 实时数据区
+        self.lbl_status = ttk.Label(left_panel, text="状态: 就绪", foreground="gray")
+        self.lbl_status.pack(pady=20)
+        
+        self.var_score = tk.StringVar(value="匹配分: 0.00")
+        self.var_thresh = tk.StringVar(value="阈值: 0.00")
+        
+        ttk.Label(left_panel, textvariable=self.var_score, font=("Arial", 12)).pack()
+        ttk.Label(left_panel, textvariable=self.var_thresh, font=("Arial", 12)).pack()
+        
+        # 进度条 (可视化匹配分)
+        self.score_bar = ttk.Progressbar(left_panel, length=150, mode='determinate', maximum=1.0)
+        self.score_bar.pack(pady=5)
+        
+        # 右侧：视觉区
+        right_panel = ttk.Frame(root, padding="10")
+        right_panel.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        
+        ttk.Label(right_panel, text="当前目标路点 (初始位置校对)", font=12).pack()
+        
+        # 图片显示容器
+        self.img_label = ttk.Label(right_panel, text="等待加载...")
+        self.img_label.pack(pady=10, expand=True)
+        
+        # 定时刷新 UI
+        self.root.after(100, self.update_ui_from_queue)
 
         # 注册全局热键
-        keyboard.add_hotkey('f9', self.start_program)
-        keyboard.add_hotkey('f10', self.stop_program)
+        keyboard.add_hotkey('f9', self.start)
+        keyboard.add_hotkey('f10', self.stop)
 
-    def start_program(self):
-        if self.is_running:
+    def update_image(self, img_path):
+        """更新 UI 显示的目标图片"""
+        if not os.path.exists(img_path):
+            return
+            
+        # 使用 Pillow 加载并调整大小
+        pil_img = Image.open(img_path)
+        # 保持比例缩放以适应 UI
+        pil_img.thumbnail((480, 270))
+        tk_img = ImageTk.PhotoImage(pil_img)
+        
+        self.img_label.configure(image=tk_img, text="")
+        self.img_label.image = tk_img # 保持引用防止被垃圾回收
+
+    def start(self):
+        if self.btn_start['state'] == tk.DISABLED:
             return
         
-        self.is_running = True
         self.stop_event.clear()
-        self.status_label.config(text="状态: 运行中...", foreground="green")
-        self.start_btn.config(state=tk.DISABLED)
-        self.stop_btn.config(state=tk.NORMAL)
+        self.btn_start.config(state=tk.DISABLED)
+        self.btn_stop.config(state=tk.NORMAL)
+        self.lbl_status.config(text="运行中...", foreground="green")
+        
+        # 启动逻辑线程
+        t = threading.Thread(target=self.run_logic_thread)
+        t.daemon = True
+        t.start()
 
-        # 在新线程中运行主逻辑
-        self.thread = threading.Thread(target=self._run_logic)
-        self.thread.daemon = True
-        self.thread.start()
-
-    def stop_program(self):
-        if not self.is_running:
+    def stop(self):
+        if self.btn_stop['state'] == tk.DISABLED:
             return
-
-        self.status_label.config(text="状态: 正在停止...", foreground="orange")
+        
+        self.lbl_status.config(text="状态: 正在停止...", foreground="orange")
         self.stop_event.set() # 发送停止信号
         
         # 等待线程结束（非阻塞方式）
-        self.root.after(100, self._check_thread_stop)
+        self.root.after(100, self.check_thread_stop)
 
-    def _check_thread_stop(self):
-        if self.thread and self.thread.is_alive():
-            self.root.after(100, self._check_thread_stop)
-        else:
-            self.is_running = False
-            self.status_label.config(text="状态: 已停止", foreground="black")
-            self.start_btn.config(state=tk.NORMAL)
-            self.stop_btn.config(state=tk.DISABLED)
+    def check_thread_stop(self):
+        # 检查线程是否停止 - 这里简化处理，直接重置UI状态
+        self.btn_start.config(state=tk.NORMAL)
+        self.btn_stop.config(state=tk.DISABLED)
+        self.lbl_status.config(text="已停止", foreground="black")
 
-    def _run_logic(self):
+    def run_logic_thread(self):
         """
-        运行主逻辑
+        这里运行原来的 main_loop
         """
-        print("导航线程启动")
-        
+        # 模拟传入回调函数给 main_loop
+        # 这里的 callback 是用来实时汇报数据的
+        def status_callback(current_img_path, score, threshold):
+            self.data_queue.put({
+                "type": "update",
+                "img": current_img_path,
+                "score": score,
+                "thresh": threshold
+            })
+            
         try:
-            # 初始化导航器和输入控制器
-            nav = SkyNavigator("dataset/isle_dawn", "dataset/isle_dawn/waypoints.json")
-            ctrl = InputController()
+            # 调用修改后的 main_loop
+            main_loop(self.stop_event, status_callback)
             
-            # 初始状态
-            is_moving = False
-            
-            print("开始初始校准...")
-            # 运行初始校准
-            calibrated = self._initial_calibration(nav, ctrl)
-            
-            if not calibrated:
-                print("校准失败，停止运行")
-                return
-            
-            print("校准成功，开始导航")
-            
-            while not self.stop_event.is_set():
-                # 1. 屏幕截图
-                frame = screen_capture()
-                
-                # 2. 计算偏移量
-                offset_x, similarity = nav.calculate_offset(frame)
-                
-                # 3. 检查是否到达目标
-                if nav.check_arrival(similarity):
-                    print(f"到达目标 ID: {nav.current_idx}")
-                    # 执行路点定义的特殊动作
-                    current_action = nav.get_current_action()
-                    action = current_action.get('action', 'walk')
-                    
-                    if action == 'fly_start':
-                        print("执行起飞动作")
-                        ctrl.jump()
-                        time.sleep(0.5)
-                        ctrl.fly_toggle()
-                        time.sleep(1) # 等待起飞动画
-                    elif action == 'interact':
-                        print("执行交互动作")
-                        ctrl.interact()
-                        time.sleep(1) # 等待交互完成
-                    elif action == 'jump':
-                        print("执行跳跃动作")
-                        ctrl.jump()
-                        time.sleep(0.5)
-                    
-                    # 切换下一个目标
-                    nav.next_waypoint()
-                    continue
-                
-                # 4. 自动视角调整
-                if not nav.is_blind():
-                    ctrl.align_camera(offset_x)
-                
-                # 5. 保持前进
-                if not is_moving:
-                    is_moving = True
-                    ctrl.move_forward()
-                
-                # 6. 限制帧率
-                time.sleep(0.1)
-                
         except Exception as e:
-            print(f"运行出错: {e}")
+            print(f"Error: {e}")
         finally:
-            # 确保异常退出时UI状态重置
-            print("清理资源...")
-            ctrl.stop_all_movement()
-            self.stop_program()
-    
-    def _initial_calibration(self, nav, ctrl):
-        """
-        初始校准：寻找匹配的环境
-        
-        Args:
-            nav: SkyNavigator 实例
-            ctrl: InputController 实例
-            
-        Returns:
-            bool: 校准成功返回 True，否则返回 False
-        """
-        search_attempts = 0
-        
-        while not self.stop_event.is_set():
-            # 1. 看一眼
-            frame = screen_capture()
-            offset, score = nav.calculate_offset(frame)
-            
-            # 2. 判断
-            if score > 0.6: # 找到了高置信度的匹配
-                print(f"校准成功！当前匹配分: {score:.2f}")
-                # 进行微调，把视角对正
-                if abs(offset) > 10:
-                    ctrl.align_camera(offset)
-                    time.sleep(0.5)
-                    continue
-                return True # 进入正式导航
+            self.data_queue.put({"type": "stop"})
+
+    def update_ui_from_queue(self):
+        """在主线程中轮询队列，更新UI"""
+        try:
+            while True:
+                data = self.data_queue.get_nowait()
                 
-            # 3. 没找到，尝试原地旋转寻找
-            print(f"未找到目标 (Score: {score:.2f})，正在搜索环境...")
-            # 向右转一点
-            ctrl.align_camera(30)
-            time.sleep(0.5) # 等画面稳定
-            
-            search_attempts += 1
-            if search_attempts > 12: # 转了一圈也没找到
-                print("校准失败：请手动移动角色到近似起始位置")
-                return False
+                if data["type"] == "update":
+                    # 更新分数显示
+                    score = data["score"]
+                    thresh = data["thresh"]
+                    
+                    self.var_score.set(f"匹配分: {score:.2f}")
+                    self.var_thresh.set(f"阈值: {thresh:.2f}")
+                    self.score_bar['value'] = score
+                    
+                    # 动态改变颜色：低于阈值显示红色警告（需要ttk style支持，这里简化处理）
+                    
+                    # 更新图片 (仅当路径变化时才重新加载，防止闪烁)
+                    if not hasattr(self, 'last_img') or self.last_img != data["img"]:
+                        self.update_image(data["img"])
+                        self.last_img = data["img"]
+                        
+                elif data["type"] == "stop":
+                    self.stop()
+                    
+        except queue.Empty:
+            pass
+        
+        # 继续轮询
+        self.root.after(100, self.update_ui_from_queue)
 
 
 if __name__ == "__main__":
     root = tk.Tk()
-    app = AutoSkyGUI(root)
+    app = AdvancedGUI(root)
     root.mainloop()
