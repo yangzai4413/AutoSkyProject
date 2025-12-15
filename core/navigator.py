@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 光遇辅助程序导航模块
-实现实时匹配与导航功能
+实现基于ORB特征的实时匹配算法
 """
 
 import cv2
@@ -12,103 +12,132 @@ import json
 import time
 
 
-class Navigator:
-    def __init__(self, dataset_path, waypoint_config_path):
+class SkyNavigator:
+    def __init__(self, dataset_path, waypoints_file):
         self.dataset_path = dataset_path
-        # 初始化 ORB 特征检测器
-        self.orb = cv2.ORB_create(nfeatures=500)
-        # 特征匹配器 (使用汉明距离)
-        self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-        
-        # 加载路点数据
-        self.waypoints = self._load_waypoints(waypoint_config_path)
+        self.waypoints = self._load_json(waypoints_file)
         self.current_idx = 0
         
-        # 预加载第一个目标图片
-        self.current_target_img = None
-        self.current_kp = None
-        self.current_des = None
-        self.load_target(0)
+        # 初始化 ORB 特征提取器
+        # nfeatures=500: 限制特征点数量，保证速度
+        self.orb = cv2.ORB_create(nfeatures=500)
+        
+        # 初始化匹配器 (使用汉明距离，适合二进制描述符)
+        self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        
+        # 缓存当前目标的数据，避免每帧重复读取硬盘
+        self.target_img = None
+        self.target_kp = None
+        self.target_des = None
+        
+        # 加载第一个目标
+        self.load_waypoint(0)
 
-    def _load_waypoints(self, path):
+    def _load_json(self, path):
         """加载 JSON 配置文件"""
         if not os.path.exists(path):
-            print("警告：未找到路点配置文件，请先标注数据！")
+            print(f"警告：未找到路点配置文件 -> {path}")
             return []
         with open(path, 'r', encoding='utf-8') as f:
             return json.load(f)
 
-    def load_target(self, idx):
-        """切换到下一个目标路点"""
-        if idx >= len(self.waypoints):
-            print("已到达终点！")
+    def load_waypoint(self, index):
+        """加载指定索引的路点作为当前目标"""
+        if index >= len(self.waypoints):
+            print("导航结束：已到达终点")
             return False
             
-        self.current_idx = idx
-        wp = self.waypoints[idx]
+        self.current_idx = index
+        wp = self.waypoints[index]
         img_path = os.path.join(self.dataset_path, wp['img_name'])
         
-        # 读取图片并提取特征
+        if not os.path.exists(img_path):
+            print(f"错误：找不到图片 {img_path}")
+            return False
+
+        # 读取并预处理目标图片
         img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-        # 这里应该应用和提取时一样的 Mask，保证特征点不出现在UI或角色身上
-        # (简化起见，这里假设提取的图片已经是处理过的或者是干净的)
+        self.target_img = img
+        # 提取目标的特征点和描述符
+        self.target_kp, self.target_des = self.orb.detectAndCompute(img, None)
         
-        self.current_target_img = img
-        self.current_kp, self.current_des = self.orb.detectAndCompute(img, None)
-        print(f"切换目标 -> ID: {wp['id']} ({wp.get('description', '')})")
+        print(f"切换目标 -> ID: {wp['id']} Action: {wp['action']} {wp.get('description', '')}")
         return True
+
+    def get_current_action(self):
+        """获取当前路点的动作类型"""
+        if self.current_idx < len(self.waypoints):
+            return self.waypoints[self.current_idx]
+        return None
 
     def calculate_offset(self, screen_frame):
         """
-        计算当前屏幕与目标图片的偏差
-        返回: (x_offset, match_score)
-        x_offset > 0: 目标在右边，需要右转
-        x_offset < 0: 目标在左边，需要左转
-        match_score: 匹配度 (0-1)，越高越好
+        核心算法：计算当前屏幕画面相对于目标画面的偏差
+        Returns:
+            offset_x: 水平偏差 (负数偏左，正数偏右)
+            similarity: 匹配相似度 (0.0 - 1.0)
         """
-        if self.current_des is None:
+        if self.target_des is None:
             return 0, 0
 
-        # 1. 处理当前屏幕帧
-        gray = cv2.cvtColor(screen_frame, cv2.COLOR_BGR2GRAY)
-        kp_screen, des_screen = self.orb.detectAndCompute(gray, None)
+        # 1. 预处理屏幕画面
+        gray_screen = cv2.cvtColor(screen_frame, cv2.COLOR_BGR2GRAY)
         
-        if des_screen is None or len(des_screen) < 10:
-            return 0, 0 # 画面太黑或无特征
+        # 2. 提取屏幕特征
+        screen_kp, screen_des = self.orb.detectAndCompute(gray_screen, None)
+        
+        if screen_des is None or len(screen_des) < 10:
+            # 画面太黑或无纹理（如纯色云层），无法匹配
+            return 0, 0.0
 
-        # 2. 特征匹配
-        matches = self.matcher.match(self.current_des, des_screen)
-        # 按距离排序，取最好的前N个匹配
+        # 3. 特征匹配
+        matches = self.matcher.match(self.target_des, screen_des)
+        
+        # 4. 筛选优质匹配点 (排序)
         matches = sorted(matches, key=lambda x: x.distance)
-        good_matches = matches[:20]
+        
+        # 取前15%的匹配点，或者至少前10个
+        num_good = max(10, int(len(matches) * 0.15))
+        good_matches = matches[:num_good]
         
         if len(good_matches) < 5:
-            return 0, 0 # 匹配失败
+            return 0, 0.0
 
-        # 3. 计算位置偏差
-        # 获取匹配点在两张图中的坐标
-        src_pts = np.float32([self.current_kp[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-        dst_pts = np.float32([kp_screen[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-
-        # 计算 X 轴的平均偏移量
-        # dst_pts (屏幕) - src_pts (目标)
-        # 如果 dst_pts 的 X 比 src_pts 小，说明目标在屏幕左边（屏幕画面偏右了）
-        # 这是一个简化算法，更高级的是用 findHomography 计算透视变换
-        diff = dst_pts - src_pts
-        x_offset = np.mean(diff[:, :, 0])
+        # 5. 计算平均位置偏差
+        # queryIdx -> target image (目标图)
+        # trainIdx -> screen image (当前屏幕)
         
-        # 简单的评分机制：距离越小分越高
+        src_pts = np.float32([self.target_kp[m.queryIdx].pt for m in good_matches])
+        dst_pts = np.float32([screen_kp[m.trainIdx].pt for m in good_matches])
+        
+        # 计算重心 (Centroid) 的差异
+        # 如果 dst_center_x > src_center_x，说明屏幕里的物体在右边 -> 或者是视角偏左了？
+        # 在FPS/TPS游戏中：
+        # 如果目标物体在屏幕右侧 (dst_x 大)，我们需要向右转鼠标，把它移到中心？
+        # 不，我们希望屏幕画面(dst) 变成 目标画面(src)。
+        # 如果 dst_x (当前) > src_x (目标)，说明物体偏右，我们需要向右转视角来对准它。
+        
+        center_src = np.mean(src_pts, axis=0)
+        center_dst = np.mean(dst_pts, axis=0)
+        
+        offset_x = center_dst[0] - center_src[0]
+        
+        # 6. 计算相似度评分 (基于特征点距离的倒数)
         avg_dist = np.mean([m.distance for m in good_matches])
-        score = max(0, 1 - avg_dist / 100.0)
-
-        # 可视化调试 (画出连线)
-        # debug_img = cv2.drawMatches(self.current_target_img, self.current_kp, gray, kp_screen, good_matches, None)
-        # cv2.imshow("Matching", debug_img)
+        # 距离越小越相似。通常 avg_dist 在 30-70 之间。
+        # 归一化一个分数
+        similarity = max(0, 1 - (avg_dist / 100.0))
         
-        return -x_offset, score # 取反，使得正数代表"目标在右边"
+        return offset_x, similarity
 
-    def should_switch_target(self, score):
-        """判断是否已经到达当前目标"""
-        # 如果匹配度极高，或者特征点偏移量非常小，说明到了
-        # 这里的阈值需要调试
-        return score > 0.85
+    def check_arrival(self, similarity):
+        """判断是否到达当前路点"""
+        # 如果匹配度超过路点设定的阈值
+        threshold = self.waypoints[self.current_idx].get('match_threshold', 0.6)
+        if similarity > threshold:
+            return True
+        return False
+
+    def next_waypoint(self):
+        """切换到下一个路点"""
+        return self.load_waypoint(self.current_idx + 1)
