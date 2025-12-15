@@ -10,6 +10,7 @@ import numpy as np
 import time
 from mss import mss
 from core.navigator import SkyNavigator
+from core.input_controller import InputController
 
 
 def screen_capture():
@@ -39,6 +40,9 @@ def main():
     # 初始化导航器
     nav = SkyNavigator("dataset/isle_dawn", "dataset/isle_dawn/waypoints.json")
     
+    # 初始化输入控制器
+    ctrl = InputController()
+    
     # 创建OpenCV窗口
     cv2.namedWindow("Sky Auto Navigator", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("Sky Auto Navigator", 800, 600)
@@ -46,8 +50,19 @@ def main():
     print("\n按 'q' 键退出测试")
     print("按 'n' 键切换到下一个目标")
     print("按 'p' 键切换到上一个目标")
+    print("按 'w' 键开始移动")
+    print("按 's' 键停止移动")
+    print("按 'a' 键左移")
+    print("按 'd' 键右移")
+    print("按 'space' 键跳跃/飞行")
     
     try:
+        # 初始状态
+        is_moving = False
+        is_moving_left = False
+        is_moving_right = False
+        blind_mode = False
+        
         while True:
             # 1. 屏幕截图
             start_time = time.time()
@@ -77,6 +92,8 @@ def main():
                 f"Action: {current_action['action']} {current_action.get('description', '')}",
                 f"Offset X: {offset_x:+.2f} (正数向右，负数向左)",
                 f"Score: {similarity:.2f}",
+                f"Consecutive Misses: {nav.consecutive_misses}",
+                f"Blind Mode: {'On' if nav.is_blind() else 'Off'}",
                 f"Capture Time: {capture_time:.3f}s",
                 f"Process Time: {process_time:.3f}s",
                 f"Total Time: {time.time() - start_time:.3f}s"
@@ -106,6 +123,7 @@ def main():
             if key == ord('q'):
                 # 退出测试
                 print("测试结束")
+                ctrl.stop_all_movement()
                 break
             elif key == ord('n'):
                 # 切换到下一个目标
@@ -113,13 +131,75 @@ def main():
             elif key == ord('p'):
                 # 切换到上一个目标
                 nav.load_waypoint(max(0, nav.current_idx - 1))
+            elif key == ord('w'):
+                # 开始/停止前进
+                is_moving = not is_moving
+                if is_moving:
+                    print("开始移动")
+                    ctrl.move_forward()
+                else:
+                    print("停止移动")
+                    ctrl.stop_moving()
+            elif key == ord('a'):
+                # 开始/停止左移
+                is_moving_left = not is_moving_left
+                if is_moving_left:
+                    print("开始左移")
+                    ctrl.move_left()
+                else:
+                    print("停止左移")
+                    ctrl.stop_moving()
+            elif key == ord('d'):
+                # 开始/停止右移
+                is_moving_right = not is_moving_right
+                if is_moving_right:
+                    print("开始右移")
+                    ctrl.move_right()
+                else:
+                    print("停止右移")
+                    ctrl.stop_moving()
+            elif key == ord('s'):
+                # 停止所有移动
+                is_moving = False
+                is_moving_left = False
+                is_moving_right = False
+                print("停止所有移动")
+                ctrl.stop_all_movement()
+            elif key == ord(' '):
+                # 跳跃/飞行
+                print("跳跃/飞行")
+                ctrl.jump()
+                time.sleep(0.1)
             
-            # 8. 检查是否到达目标
+            # 8. 自动视角调整
+            # 只有在非盲飞模式下才调整视角
+            if not nav.is_blind():
+                ctrl.align_camera(offset_x)
+            
+            # 9. 检查是否到达目标
             if nav.check_arrival(similarity):
-                print(f"到达目标 ID: {nav.current_idx}，准备切换到下一个目标")
+                print(f"到达目标 ID: {nav.current_idx}")
+                # 执行路点定义的特殊动作
+                action = current_action.get('action', 'walk')
+                if action == 'fly_start':
+                    print("执行起飞动作")
+                    ctrl.jump()
+                    time.sleep(0.5)
+                    ctrl.fly_toggle()
+                    time.sleep(1) # 等待起飞动画
+                elif action == 'interact':
+                    print("执行交互动作")
+                    ctrl.interact()
+                    time.sleep(1) # 等待交互完成
+                elif action == 'jump':
+                    print("执行跳跃动作")
+                    ctrl.jump()
+                    time.sleep(0.5)
+                
+                # 切换下一个目标
                 nav.next_waypoint()
             
-            # 限制帧率
+            # 10. 限制帧率
             time.sleep(0.1)
     
     except KeyboardInterrupt:
@@ -127,6 +207,7 @@ def main():
     finally:
         # 清理资源
         cv2.destroyAllWindows()
+        ctrl.stop_all_movement()
         print("=== 测试完成 ===")
 
 

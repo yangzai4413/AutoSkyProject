@@ -32,6 +32,10 @@ class SkyNavigator:
         
         # 加载第一个目标
         self.load_waypoint(0)
+        
+        # 状态追踪：用于盲飞模式
+        self.consecutive_misses = 0 # 连续丢失目标的帧数
+        self.blind_threshold = 10   # 连续10帧匹配不上，认为丢失视野
 
     def _load_json(self, path):
         """加载 JSON 配置文件"""
@@ -88,6 +92,7 @@ class SkyNavigator:
         
         if screen_des is None or len(screen_des) < 10:
             # 画面太黑或无纹理（如纯色云层），无法匹配
+            self.consecutive_misses += 1
             return 0, 0.0
 
         # 3. 特征匹配
@@ -101,6 +106,7 @@ class SkyNavigator:
         good_matches = matches[:num_good]
         
         if len(good_matches) < 5:
+            self.consecutive_misses += 1
             return 0, 0.0
 
         # 5. 计算平均位置偏差
@@ -128,7 +134,21 @@ class SkyNavigator:
         # 归一化一个分数
         similarity = max(0, 1 - (avg_dist / 100.0))
         
+        # 更新连续丢失目标的帧数
+        if similarity < 0.2: # 假设 0.2 是极低分
+            self.consecutive_misses += 1
+        else:
+            self.consecutive_misses = 0
+        
         return offset_x, similarity
+        
+    def is_blind(self):
+        """
+        判断是否进入盲飞模式
+        Returns:
+            bool: True 表示进入盲飞模式，False 表示正常导航模式
+        """
+        return self.consecutive_misses > self.blind_threshold
 
     def check_arrival(self, similarity):
         """判断是否到达当前路点"""
