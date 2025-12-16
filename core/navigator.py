@@ -13,14 +13,17 @@ import time
 
 
 class SkyNavigator:
-    def __init__(self, dataset_path, waypoints_file, use_edge_feature=True):
+    def __init__(self, dataset_path, waypoints_file, use_edge_feature=True, use_clahe=False):
         self.dataset_path = dataset_path
         self.waypoints = self._load_json(waypoints_file)
         self.current_idx = 0
         self.use_edge_feature = use_edge_feature # 新增：是否启用边缘特征
+        self.use_clahe = use_clahe  # 新增：是否使用CLAHE增强对比度
         
         # 调整 ORB 参数：因为边缘图特征点较少，需要降低阈值灵敏度
-        self.orb = cv2.ORB_create(nfeatures=1000, scoreType=cv2.ORB_FAST_SCORE)
+        # 修复：将 nfeatures 从 1000 增加到 1500
+        # 使用 FAST_SCORE，对边缘图更敏感
+        self.orb = cv2.ORB_create(nfeatures=1500, scoreType=cv2.ORB_FAST_SCORE)
         
         # 初始化匹配器 (使用汉明距离，适合二进制描述符)
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
@@ -48,8 +51,10 @@ class SkyNavigator:
     def _preprocess(self, img):
         """
         核心改进：图像预处理
-        将图像转换为边缘图，抵抗光照变化
+        将图像转换为边缘图或增强对比度，抵抗光照变化
         """
+        if img is None: return None
+        
         # 1. 统一转灰度
         if len(img.shape) == 3:
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -58,9 +63,16 @@ class SkyNavigator:
 
         if self.use_edge_feature:
             # 2. Canny 边缘检测
-            # 阈值需要根据晨岛的画风微调，建议 50, 150
-            edges = cv2.Canny(gray, 50, 150)
+            # 修复：将阈值从 50, 150 降低到 20, 60
+            # 这样即使是云彩淡淡的轮廓也能被提取出来
+            edges = cv2.Canny(gray, 20, 60)
             return edges
+        elif self.use_clahe:
+            # 备用方案：使用 CLAHE 增强对比度
+            # 适用于光影柔和，Canny提取不出线条的场景
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            enhanced_gray = clahe.apply(gray)
+            return enhanced_gray
         else:
             return gray
 

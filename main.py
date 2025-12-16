@@ -89,6 +89,14 @@ def main_loop(stop_event, status_callback=None):
             # 1. 屏幕截图 & 缩放
             frame = capture_and_resize() # 确保返回的是 (640, 360) 的图
             
+            # === 调试代码 Start ===
+            # 调用预处理，看看机器看到的是什么
+            debug_edge = nav._preprocess(frame)
+            if debug_edge is not None:
+                cv2.imshow("DEBUG: What Bot Sees", debug_edge)
+                cv2.waitKey(1)
+            # === 调试代码 End ===
+            
             # 2. 计算偏移量
             offset_x, similarity = nav.calculate_offset(frame)
             current_thresh = nav.waypoints[nav.current_idx].get('match_threshold', 0.6)
