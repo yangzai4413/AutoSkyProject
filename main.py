@@ -1,34 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-光遇辅助程序主入口
+光遇辅助程序主入口 - 高级版
 实现视觉导航核心的集成测试
 """
 
 import cv2
 import numpy as np
 import time
-from mss import mss
+import ctypes
+import os
 from core.navigator import SkyNavigator
 from core.input_controller import InputController
+from core.vision import VisionSystem
+from core.input_emul import InputManager
 
 
-def screen_capture():
+# === 关键：检查管理员权限 ===
+def is_admin():
     """
-    使用mss库进行屏幕截图
-    
-    Returns:
-        numpy.ndarray: 屏幕截图
+    检查程序是否以管理员身份运行
     """
-    with mss() as sct:
-        # 捕获整个屏幕
-        monitor = sct.monitors[1]
-        screenshot = sct.grab(monitor)
-        # 转换为OpenCV格式
-        img = np.array(screenshot)
-        # 转换颜色空间 (BGRA to BGR)
-        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-        return img
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
 
 
 # 假设你的数据集图片是 640x360
@@ -36,182 +32,41 @@ DATASET_WIDTH = 640
 DATASET_HEIGHT = 360
 
 
-def capture_and_resize():
-    """
-    截取全屏并缩放到标准处理分辨率
-    """
-    # 1. 获取全屏截图
-    screenshot = screen_capture()
-    
-    # 2. 强制缩放 (解决分辨率适配问题)
-    # 无论屏幕是 1920x1080 还是 2560x1440，都压扁到 640x360 进行处理
-    # 这样 offset 的单位永远是基于 640 宽度的，不需要动态调整 PID 参数
-    resized_frame = cv2.resize(screenshot, (DATASET_WIDTH, DATASET_HEIGHT))
-    
-    return resized_frame
-
-
-def main_loop(stop_event, status_callback=None):
-    """
-    主循环函数，接受停止事件和状态回调
-    
-    Args:
-        stop_event: 用于停止循环的事件对象
-        status_callback: 状态回调函数，用于实时汇报状态
-    """
-    print("导航线程启动")
-    
-    try:
-        # 初始化导航器和输入控制器
-        nav = SkyNavigator("dataset/isle_dawn", "dataset/isle_dawn/waypoints.json")
-        ctrl = InputController()
-        
-        # 初始状态
-        is_moving = False
-        
-        # 初始校准：发送第一张路点图给 UI
-        if status_callback:
-            first_wp = nav.waypoints[0]
-            first_img_path = os.path.join(nav.dataset_path, first_wp['img_name'])
-            status_callback(first_img_path, 0.0, 0.0)
-        
-        print("开始初始校准...")
-        # 运行初始校准
-        calibrated = _initial_calibration(nav, ctrl, stop_event, status_callback)
-        
-        if not calibrated:
-            print("校准失败，停止运行")
-            return
-        
-        print("校准成功，开始导航")
-        
-        while not stop_event.is_set():
-            # 1. 屏幕截图 & 缩放
-            frame = capture_and_resize() # 确保返回的是 (640, 360) 的图
-            
-            # === 调试代码 Start ===
-            # 调用预处理，看看机器看到的是什么
-            debug_edge = nav._preprocess(frame)
-            if debug_edge is not None:
-                cv2.imshow("DEBUG: What Bot Sees", debug_edge)
-                cv2.waitKey(1)
-            # === 调试代码 End ===
-            
-            # 2. 计算偏移量
-            offset_x, similarity = nav.calculate_offset(frame)
-            current_thresh = nav.waypoints[nav.current_idx].get('match_threshold', 0.6)
-            
-            # 3. 汇报状态给 UI
-            if status_callback:
-                # 获取当前目标图片的绝对路径
-                wp = nav.waypoints[nav.current_idx]
-                img_path = os.path.join(nav.dataset_path, wp['img_name'])
-                
-                status_callback(img_path, similarity, current_thresh)
-            
-            # 4. 检查是否到达目标
-            if nav.check_arrival(similarity):
-                print(f"到达目标 ID: {nav.current_idx}")
-                # 执行路点定义的特殊动作
-                current_action = nav.get_current_action()
-                action = current_action.get('action', 'walk')
-                
-                if action == 'fly_start':
-                    print("执行起飞动作")
-                    ctrl.jump()
-                    time.sleep(0.5)
-                    ctrl.fly_toggle()
-                    time.sleep(1) # 等待起飞动画
-                elif action == 'interact':
-                    print("执行交互动作")
-                    ctrl.interact()
-                    time.sleep(1) # 等待交互完成
-                elif action == 'jump':
-                    print("执行跳跃动作")
-                    ctrl.jump()
-                    time.sleep(0.5)
-                
-                # 切换下一个目标
-                nav.next_waypoint()
-                continue
-            
-            # 5. 自动视角调整
-            # 只有在非盲飞模式下才调整视角
-            if not nav.is_blind():
-                ctrl.align_camera(offset_x)
-            
-            # 6. 保持前进
-            if not is_moving:
-                is_moving = True
-                ctrl.move_forward()
-            
-            # 7. 限制帧率
-            time.sleep(0.1)
-            
-    except Exception as e:
-        print(f"运行出错: {e}")
-    finally:
-        # 确保异常退出时UI状态重置
-        print("清理资源...")
-        ctrl.stop_all_movement()
-
-
-def _initial_calibration(nav, ctrl, stop_event, status_callback=None):
-    """
-    初始校准：寻找匹配的环境
-    
-    Args:
-        nav: SkyNavigator 实例
-        ctrl: InputController 实例
-        stop_event: 停止事件
-        status_callback: 状态回调
-        
-    Returns:
-        bool: 校准成功返回 True，否则返回 False
-    """
-    search_attempts = 0
-    
-    while not stop_event.is_set():
-        # 1. 看一眼
-        frame = capture_and_resize()
-        offset, score = nav.calculate_offset(frame)
-        
-        # 2. 汇报状态
-        if status_callback:
-            wp = nav.waypoints[nav.current_idx]
-            img_path = os.path.join(nav.dataset_path, wp['img_name'])
-            status_callback(img_path, score, 0.6)  # 校准阈值固定为0.6
-        
-        # 3. 判断
-        if score > 0.6: # 找到了高置信度的匹配
-            print(f"校准成功！当前匹配分: {score:.2f}")
-            # 进行微调，把视角对正
-            if abs(offset) > 10:
-                ctrl.align_camera(offset)
-                time.sleep(0.5)
-                continue
-            return True # 进入正式导航
-            
-        # 4. 没找到，尝试原地旋转寻找
-        print(f"未找到目标 (Score: {score:.2f})，正在搜索环境...")
-        # 向右转一点
-        ctrl.align_camera(30)
-        time.sleep(0.5) # 等画面稳定
-        
-        search_attempts += 1
-        if search_attempts > 12: # 转了一圈也没找到
-            print("校准失败：请手动移动角色到近似起始位置")
-            return False
-
-
 def main():
     """
     主函数 - 用于测试和调试
     """
-    print("=== 光遇辅助程序 - 视觉导航测试 ===")
+    # 检查管理员权限
+    if not is_admin():
+        print("【严重错误】程序必须以管理员身份运行！")
+        print("请右键点击 VSCode 或 CMD，选择'以管理员身份运行'。")
+        input("按回车键退出...")
+        return
     
-    # 初始化导航器 - 启用边缘特征
-    nav = SkyNavigator("dataset/isle_dawn", "dataset/isle_dawn/waypoints.json", use_edge_feature=True)
+    print("=== 光遇辅助程序 - 视觉导航测试 ===")
+    print("正在初始化系统...")
+    
+    # 1. 实例化模块
+    # Windows下《光遇》的窗口标题通常包含 "Sky"
+    vision = VisionSystem(window_title="Sky")
+    input_mgr = InputManager(window_title="Sky")
+    
+    # 2. 执行启动自检
+    print("准备开始自检，请确保游戏已启动且未在菜单界面...")
+    time.sleep(2) # 给用户一点反应时间
+    
+    # 运行测试：旋转 + WASD
+    input_mgr.run_startup_test()
+
+    print("自检完成。准备进入自动导航模式...")
+    time.sleep(1)
+    
+    # 3. 初始化导航器 - 启用边缘特征
+    nav = SkyNavigator(
+        "dataset/isle_dawn", 
+        "dataset/isle_dawn/waypoints.json", 
+        use_edge_feature=True
+    )
     
     # 初始化输入控制器
     ctrl = InputController()
@@ -219,6 +74,8 @@ def main():
     # 创建OpenCV窗口
     cv2.namedWindow("Sky Auto Navigator", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("Sky Auto Navigator", 800, 600)
+    cv2.namedWindow("Bot View", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Bot View", 640, 360)
     
     print("\n按 'q' 键退出测试")
     print("按 'n' 键切换到下一个目标")
@@ -237,13 +94,19 @@ def main():
         blind_mode = False
         
         while True:
-            # 1. 屏幕截图 & 缩放
+            # 1. 视觉感知 - 使用区域截屏
             start_time = time.time()
-            screen = capture_and_resize()  # 使用新的归一化截图函数
+            
+            # 使用新的VisionSystem进行区域截屏
+            screen = vision.capture_screen()
+            
+            # 缩放为标准处理分辨率
+            resized_screen = cv2.resize(screen, (DATASET_WIDTH, DATASET_HEIGHT))
+            
             capture_time = time.time() - start_time
             
             # 2. 计算偏移量
-            offset_x, similarity = nav.calculate_offset(screen)
+            offset_x, similarity = nav.calculate_offset(resized_screen)
             process_time = time.time() - start_time - capture_time
             
             # 3. 获取当前动作
@@ -289,6 +152,11 @@ def main():
             
             # 6. 显示结果
             cv2.imshow("Sky Auto Navigator", display_img)
+            
+            # 显示机器看到的画面
+            bot_view = nav._preprocess(resized_screen)
+            if bot_view is not None:
+                cv2.imshow("Bot View", cv2.resize(bot_view, (640, 360)))
             
             # 7. 检查按键
             key = cv2.waitKey(1) & 0xFF
@@ -377,11 +245,179 @@ def main():
     
     except KeyboardInterrupt:
         print("\n测试中断")
+    except Exception as e:
+        print(f"运行出错: {e}")
     finally:
         # 清理资源
         cv2.destroyAllWindows()
         ctrl.stop_all_movement()
         print("=== 测试完成 ===")
+
+
+def main_loop(stop_event, status_callback=None):
+    """
+    主循环函数，接受停止事件和状态回调
+    
+    Args:
+        stop_event: 用于停止循环的事件对象
+        status_callback: 状态回调函数，用于实时汇报状态
+    """
+    print("导航线程启动")
+    
+    try:
+        # 1. 实例化模块
+        vision = VisionSystem(window_title="Sky")
+        input_mgr = InputManager(window_title="Sky")
+        
+        # 初始化导航器和输入控制器
+        nav = SkyNavigator(
+            "dataset/isle_dawn", 
+            "dataset/isle_dawn/waypoints.json", 
+            use_edge_feature=True
+        )
+        ctrl = InputController()
+        
+        # 初始状态
+        is_moving = False
+        
+        # 初始校准：发送第一张路点图给 UI
+        if status_callback:
+            first_wp = nav.waypoints[0]
+            first_img_path = os.path.join(nav.dataset_path, first_wp['img_name'])
+            status_callback(first_img_path, 0.0, 0.0)
+        
+        print("开始初始校准...")
+        # 运行初始校准
+        calibrated = _initial_calibration(nav, ctrl, vision, stop_event, status_callback)
+        
+        if not calibrated:
+            print("校准失败，停止运行")
+            return
+        
+        print("校准成功，开始导航")
+        
+        while not stop_event.is_set():
+            # 1. 屏幕截图 & 缩放 - 使用区域截屏
+            frame = vision.capture_screen()
+            resized_frame = cv2.resize(frame, (DATASET_WIDTH, DATASET_HEIGHT))
+            
+            # === 调试代码 Start ===
+            # 调用预处理，看看机器看到的是什么
+            debug_edge = nav._preprocess(resized_frame)
+            if debug_edge is not None:
+                cv2.imshow("DEBUG: What Bot Sees", debug_edge)
+                cv2.waitKey(1)
+            # === 调试代码 End ===
+            
+            # 2. 计算偏移量
+            offset_x, similarity = nav.calculate_offset(resized_frame)
+            current_thresh = nav.waypoints[nav.current_idx].get('match_threshold', 0.6)
+            
+            # 3. 汇报状态给 UI
+            if status_callback:
+                # 获取当前目标图片的绝对路径
+                wp = nav.waypoints[nav.current_idx]
+                img_path = os.path.join(nav.dataset_path, wp['img_name'])
+                
+                status_callback(img_path, similarity, current_thresh)
+            
+            # 4. 检查是否到达目标
+            if nav.check_arrival(similarity):
+                print(f"到达目标 ID: {nav.current_idx}")
+                # 执行路点定义的特殊动作
+                current_action = nav.get_current_action()
+                action = current_action.get('action', 'walk')
+                
+                if action == 'fly_start':
+                    print("执行起飞动作")
+                    ctrl.jump()
+                    time.sleep(0.5)
+                    ctrl.fly_toggle()
+                    time.sleep(1) # 等待起飞动画
+                elif action == 'interact':
+                    print("执行交互动作")
+                    ctrl.interact()
+                    time.sleep(1) # 等待交互完成
+                elif action == 'jump':
+                    print("执行跳跃动作")
+                    ctrl.jump()
+                    time.sleep(0.5)
+                
+                # 切换下一个目标
+                nav.next_waypoint()
+                continue
+            
+            # 5. 自动视角调整
+            # 只有在非盲飞模式下才调整视角
+            if not nav.is_blind():
+                ctrl.align_camera(offset_x)
+            
+            # 6. 保持前进
+            if not is_moving:
+                is_moving = True
+                ctrl.move_forward()
+            
+            # 7. 限制帧率
+            time.sleep(0.1)
+            
+    except Exception as e:
+        print(f"运行出错: {e}")
+    finally:
+        # 确保异常退出时UI状态重置
+        print("清理资源...")
+        cv2.destroyAllWindows()
+        ctrl.stop_all_movement()
+
+
+def _initial_calibration(nav, ctrl, vision, stop_event, status_callback=None):
+    """
+    初始校准：寻找匹配的环境
+    
+    Args:
+        nav: SkyNavigator 实例
+        ctrl: InputController 实例
+        vision: VisionSystem 实例
+        stop_event: 停止事件
+        status_callback: 状态回调
+        
+    Returns:
+        bool: 校准成功返回 True，否则返回 False
+    """
+    search_attempts = 0
+    
+    while not stop_event.is_set():
+        # 1. 看一眼 - 使用区域截屏
+        frame = vision.capture_screen()
+        resized_frame = cv2.resize(frame, (DATASET_WIDTH, DATASET_HEIGHT))
+        
+        offset, score = nav.calculate_offset(resized_frame)
+        
+        # 2. 汇报状态
+        if status_callback:
+            wp = nav.waypoints[nav.current_idx]
+            img_path = os.path.join(nav.dataset_path, wp['img_name'])
+            status_callback(img_path, score, 0.6)  # 校准阈值固定为0.6
+        
+        # 3. 判断
+        if score > 0.6: # 找到了高置信度的匹配
+            print(f"校准成功！当前匹配分: {score:.2f}")
+            # 进行微调，把视角对正
+            if abs(offset) > 10:
+                ctrl.align_camera(offset)
+                time.sleep(0.5)
+                continue
+            return True # 进入正式导航
+            
+        # 4. 没找到，尝试原地旋转寻找
+        print(f"未找到目标 (Score: {score:.2f})，正在搜索环境...")
+        # 向右转一点
+        ctrl.align_camera(30)
+        time.sleep(0.5) # 等画面稳定
+        
+        search_attempts += 1
+        if search_attempts > 12: # 转了一圈也没找到
+            print("校准失败：请手动移动角色到近似起始位置")
+            return False
 
 
 if __name__ == "__main__":
